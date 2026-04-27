@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 import time
 
@@ -108,14 +110,28 @@ def fmt_loads(v):
 
 # ── Data Fetching ────────────────────────────────────────────────────────────
 
+def _lmr_session() -> requests.Session:
+    """Requests session with retry + backoff for the slow USDA LMR API."""
+    session = requests.Session()
+    retry = Retry(
+        total=4,
+        backoff_factor=2,           # waits 2, 4, 8, 16 s between retries
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_lmr(last_n: int = 550):
     """
     Pull allSections for the last N reports from the USDA LMR API.
     Returns a dict keyed by section name, each value a DataFrame.
     """
-    url = f"{LMR_BASE}/{REPORT_ID}/"
-    resp = requests.get(url, params={"lastReports": last_n, "allSections": "true"}, timeout=30)
+    url  = f"{LMR_BASE}/{REPORT_ID}/"
+    sess = _lmr_session()
+    resp = sess.get(url, params={"lastReports": last_n, "allSections": "true"}, timeout=90)
     resp.raise_for_status()
 
     payload = resp.json()
