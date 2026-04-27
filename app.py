@@ -114,8 +114,8 @@ def _lmr_session() -> requests.Session:
     """Requests session with retry + backoff for the slow USDA LMR API."""
     session = requests.Session()
     retry = Retry(
-        total=4,
-        backoff_factor=2,           # waits 2, 4, 8, 16 s between retries
+        total=3,
+        backoff_factor=3,           # waits 3, 9, 27 s between retries
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
@@ -123,15 +123,16 @@ def _lmr_session() -> requests.Session:
     return session
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_lmr(last_n: int = 550):
+# persist="disk" survives app sleep/wake cycles — users never hit a cold fetch
+@st.cache_data(ttl=7200, persist="disk", show_spinner=False)
+def fetch_lmr(last_n: int = 260):
     """
     Pull allSections for the last N reports from the USDA LMR API.
     Returns a dict keyed by section name, each value a DataFrame.
     """
     url  = f"{LMR_BASE}/{REPORT_ID}/"
     sess = _lmr_session()
-    resp = sess.get(url, params={"lastReports": last_n, "allSections": "true"}, timeout=90)
+    resp = sess.get(url, params={"lastReports": last_n, "allSections": "true"}, timeout=60)
     resp.raise_for_status()
 
     payload = resp.json()
@@ -217,10 +218,9 @@ with st.sidebar:
     st.markdown('<div class="sec-header">History Window</div>', unsafe_allow_html=True)
     history_n = st.selectbox(
         "Reports to load",
-        [130, 260, 400, 550],
-        index=2,
-        format_func=lambda x: {130: "~6 Months", 260: "~1 Year",
-                                400: "~18 Months", 550: "~2 Years"}[x],
+        [130, 260, 400],
+        index=1,
+        format_func=lambda x: {130: "~6 Months", 260: "~1 Year", 400: "~18 Months"}[x],
         label_visibility="collapsed",
     )
 
@@ -289,10 +289,12 @@ with c2:
 st.markdown("<hr style='margin:10px 0 18px;'>", unsafe_allow_html=True)
 
 if not load_ok:
-    st.error(f"**Failed to load data:** {err_msg}")
-    with st.expander("Debug"):
-        st.write("URL:", f"{LMR_BASE}/{REPORT_ID}/")
-        st.write("Error:", err_msg)
+    st.warning(
+        "⏳ **USDA data temporarily unavailable** — the USDA LMR server is not responding. "
+        "This usually resolves in a few minutes. Use **Refresh Now** in the sidebar to retry."
+    )
+    with st.expander("Technical details"):
+        st.code(err_msg)
     st.stop()
 
 if hist.empty:
