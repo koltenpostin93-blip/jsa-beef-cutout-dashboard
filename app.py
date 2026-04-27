@@ -93,11 +93,10 @@ def delta_html(val, suffix=""):
 
 
 def tile(label, value, delta="", cls=""):
-    return f"""<div class="tile {cls}">
-      <div class="tile-label">{label}</div>
-      <div class="tile-value">{value}</div>
-      {delta}
-    </div>"""
+    return (f'<div class="tile {cls}">'
+            f'<div class="tile-label">{label}</div>'
+            f'<div class="tile-value">{value}</div>'
+            f'{delta}</div>')
 
 
 def fmt(v, prefix="$"):
