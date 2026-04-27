@@ -1,0 +1,496 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+from datetime import datetime, timedelta
+import time
+
+# ── JSA Brand Colors ────────────────────────────────────────────────────────
+JSA_GREEN    = "#5e7164"
+JSA_GREEN_LT = "#8db89a"
+
+DM_BG       = "#0d1210"
+DM_SURFACE  = "#141c18"
+DM_SURFACE2 = "#1a2620"
+DM_BORDER   = "#253328"
+DM_TEXT     = "#e8ede9"
+DM_MUTED    = "#7a9485"
+COL_POS     = "#8db89a"
+COL_NEG     = "#e07070"
+COL_NEU     = "#7a9485"
+
+CHOICE_COLOR = "#8db89a"
+SELECT_COLOR = "#6fa8c4"
+SPREAD_COLOR = "#c4b456"
+VOL_COLOR    = "#9b89c4"
+
+JSA_LOGO_WHITE = "https://www.jpsi.com/wp-content/themes/gate39media/img/logo-white.png"
+
+# ── USDA LMR API (no key required) ──────────────────────────────────────────
+LMR_BASE    = "https://mpr.datamart.ams.usda.gov/services/v1.1/reports"
+REPORT_ID   = 2453   # LM_XB403 — National Daily Boxed Beef Cutout & Boxed Beef Cuts PM
+REPORT_NAME = "LM_XB403"
+
+# ── Page Config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="JSA Daily Beef Cutout",
+    page_icon="🐄",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(f"""
+<style>
+  html, body, [data-testid="stAppViewContainer"] {{
+    background-color:{DM_BG}; color:{DM_TEXT};
+  }}
+  [data-testid="stSidebar"] {{
+    background-color:{DM_SURFACE}; border-right:1px solid {DM_BORDER};
+  }}
+  [data-testid="stSidebar"] * {{ color:{DM_TEXT} !important; }}
+
+  .tile {{
+    background:{DM_SURFACE}; border:1px solid {DM_BORDER};
+    border-top:3px solid {JSA_GREEN}; border-radius:10px;
+    padding:16px 20px; text-align:center; height:100%;
+  }}
+  .tile-label {{
+    color:{DM_MUTED}; font-size:0.68rem; text-transform:uppercase;
+    letter-spacing:0.09em; margin-bottom:6px;
+  }}
+  .tile-value {{
+    color:{DM_TEXT}; font-size:1.65rem; font-weight:700; line-height:1.1;
+  }}
+  .tile-delta-pos {{ color:{COL_POS}; font-size:0.82rem; font-weight:600; margin-top:4px; }}
+  .tile-delta-neg {{ color:{COL_NEG}; font-size:0.82rem; font-weight:600; margin-top:4px; }}
+  .tile-delta-neu {{ color:{COL_NEU}; font-size:0.82rem; font-weight:600; margin-top:4px; }}
+
+  .tile-choice {{ border-top-color:{CHOICE_COLOR}; }}
+  .tile-select {{ border-top-color:{SELECT_COLOR}; }}
+  .tile-spread {{ border-top-color:{SPREAD_COLOR}; }}
+  .tile-vol    {{ border-top-color:{VOL_COLOR}; }}
+
+  .sec-header {{
+    color:{DM_MUTED}; font-size:0.7rem; text-transform:uppercase;
+    letter-spacing:0.1em; padding:8px 0 4px; border-bottom:1px solid {DM_BORDER};
+    margin-bottom:10px;
+  }}
+  hr {{ border-color:{DM_BORDER}; }}
+  #MainMenu, footer {{ visibility:hidden; }}
+  .stDeployButton {{ display:none; }}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def delta_html(val, suffix=""):
+    if val is None:
+        return '<div class="tile-delta-neu">—</div>'
+    sign  = "▲" if val > 0 else ("▼" if val < 0 else "")
+    color = "pos" if val > 0 else ("neg" if val < 0 else "neu")
+    return f'<div class="tile-delta-{color}">{sign} {abs(val):.2f}{suffix}</div>'
+
+
+def tile(label, value, delta="", cls=""):
+    return f"""<div class="tile {cls}">
+      <div class="tile-label">{label}</div>
+      <div class="tile-value">{value}</div>
+      {delta}
+    </div>"""
+
+
+def fmt(v, prefix="$"):
+    return f"{prefix}{v:.2f}" if v is not None else "—"
+
+def fmt_loads(v):
+    return f"{v:.1f}" if v is not None else "—"
+
+
+# ── Data Fetching ────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_lmr(last_n: int = 550):
+    """
+    Pull allSections for the last N reports from the USDA LMR API.
+    Returns a dict keyed by section name, each value a DataFrame.
+    """
+    url = f"{LMR_BASE}/{REPORT_ID}/"
+    resp = requests.get(url, params={"lastReports": last_n, "allSections": "true"}, timeout=30)
+    resp.raise_for_status()
+
+    payload = resp.json()
+    sections = {}
+    for sec in (payload if isinstance(payload, list) else [payload]):
+        name    = sec.get("reportSection", "")
+        results = sec.get("results", [])
+        if results:
+            df = pd.DataFrame(results)
+            df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+            df = df.dropna(subset=["report_date"]).sort_values("report_date")
+            sections[name] = df
+    return sections
+
+
+def build_history(sections: dict) -> pd.DataFrame:
+    """Merge Cutout + Volume sections into a clean daily DataFrame."""
+    cutout = sections.get("Current Cutout Values", pd.DataFrame())
+    volume = sections.get("Current Volume",        pd.DataFrame())
+
+    if cutout.empty:
+        raise ValueError("'Current Cutout Values' section returned no data.")
+
+    df = cutout[["report_date"]].copy()
+    df["choice"] = pd.to_numeric(cutout.get("choice_600_900_current"), errors="coerce")
+    df["select"] = pd.to_numeric(cutout.get("select_600_900_current"), errors="coerce")
+    df["spread"] = df["choice"] - df["select"]
+
+    if not volume.empty:
+        vol = volume[["report_date"]].copy()
+        for c in ["choice_volume_loads", "select_volume_loads",
+                  "trimmings_volume_loads", "coarse_volume_loads"]:
+            vol[c] = pd.to_numeric(volume.get(c), errors="coerce")
+        vol["total_loads"] = (
+            vol["choice_volume_loads"].fillna(0) +
+            vol["select_volume_loads"].fillna(0) +
+            vol["trimmings_volume_loads"].fillna(0) +
+            vol["coarse_volume_loads"].fillna(0)
+        )
+        vol["choice_loads"] = vol["choice_volume_loads"]
+        vol["select_loads"] = vol["select_volume_loads"]
+        df = df.merge(vol[["report_date", "total_loads", "choice_loads", "select_loads"]],
+                      on="report_date", how="left")
+    else:
+        df["total_loads"]  = None
+        df["choice_loads"] = None
+        df["select_loads"] = None
+
+    return df.reset_index(drop=True)
+
+
+def changes(df: pd.DataFrame, col: str):
+    """Return (current, day_chg, month_chg, year_chg)."""
+    valid = df[df[col].notna()]
+    if valid.empty:
+        return None, None, None, None
+    cur  = valid.iloc[-1]
+    cval = cur[col]
+    cdt  = cur["report_date"]
+
+    def prior(delta):
+        sub = valid[valid["report_date"] <= cdt - delta]
+        return sub.iloc[-1][col] if not sub.empty else None
+
+    p1   = prior(timedelta(days=2))
+    p30  = prior(timedelta(days=30))
+    p365 = prior(timedelta(days=365))
+
+    return (
+        cval,
+        cval - p1   if p1   is not None else None,
+        cval - p30  if p30  is not None else None,
+        cval - p365 if p365 is not None else None,
+    )
+
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.image(JSA_LOGO_WHITE, use_container_width=True)
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-header">History Window</div>', unsafe_allow_html=True)
+    history_n = st.selectbox(
+        "Reports to load",
+        [130, 260, 400, 550],
+        index=2,
+        format_func=lambda x: {130: "~6 Months", 260: "~1 Year",
+                                400: "~18 Months", 550: "~2 Years"}[x],
+        label_visibility="collapsed",
+    )
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">Data Refresh</div>', unsafe_allow_html=True)
+    auto_refresh = st.toggle("Auto-refresh (30 min)", value=False)
+    if st.button("↺  Refresh Now", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="color:{DM_MUTED};font-size:0.72rem;line-height:1.6;">'
+        f'Source: USDA AMS Livestock Mandatory Reporting<br>'
+        f'Report: <b>LM_XB403</b> (National Daily Boxed Beef Cutout &amp; Boxed Beef Cuts — PM)<br><br>'
+        f'Published twice daily:<br>'
+        f'&nbsp;&nbsp;AM ~10:30 CT &nbsp;·&nbsp; PM ~2:30 CT<br><br>'
+        f'Cache: 30 min. Use <b>Refresh Now</b> to force reload.</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ── Load Data ────────────────────────────────────────────────────────────────
+
+with st.spinner("Loading USDA beef cutout data…"):
+    try:
+        sections = fetch_lmr(last_n=history_n)
+        hist     = build_history(sections)
+        load_ok  = True
+        err_msg  = ""
+    except Exception as e:
+        load_ok  = False
+        err_msg  = str(e)
+        sections = {}
+        hist     = pd.DataFrame()
+
+
+# ── Header ───────────────────────────────────────────────────────────────────
+
+c1, c2 = st.columns([7, 3])
+with c1:
+    st.markdown(
+        f"<h1 style='color:{DM_TEXT};margin:0;padding:0;font-size:1.9rem;'>"
+        "Daily Beef Cutout</h1>"
+        f"<div style='color:{DM_MUTED};font-size:0.8rem;margin-top:2px;'>"
+        "Choice &amp; Select Composite 600–900 lbs · USDA LMR LM_XB403</div>",
+        unsafe_allow_html=True,
+    )
+with c2:
+    if load_ok and not hist.empty:
+        last_date = hist["report_date"].max()
+        pub_date  = sections.get("Summary", pd.DataFrame())
+        pub_str   = ""
+        if not pub_date.empty and "published_date" in pub_date.columns:
+            pub_str = pub_date.iloc[-1].get("published_date", "")
+        st.markdown(
+            f"<div style='text-align:right;color:{DM_MUTED};font-size:0.75rem;padding-top:6px;'>"
+            f"Most recent report<br>"
+            f"<span style='color:{JSA_GREEN_LT};font-size:1rem;font-weight:700;'>"
+            f"{last_date.strftime('%b %d, %Y')}</span>"
+            + (f"<br><span style='font-size:0.7rem;'>{pub_str}</span>" if pub_str else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+st.markdown("<hr style='margin:10px 0 18px;'>", unsafe_allow_html=True)
+
+if not load_ok:
+    st.error(f"**Failed to load data:** {err_msg}")
+    with st.expander("Debug"):
+        st.write("URL:", f"{LMR_BASE}/{REPORT_ID}/")
+        st.write("Error:", err_msg)
+    st.stop()
+
+if hist.empty:
+    st.warning("No data returned from USDA LMR API.")
+    st.stop()
+
+
+# ── Compute Changes ──────────────────────────────────────────────────────────
+
+cn, cd1, cd30, cd365 = changes(hist, "choice")
+sn, sd1, sd30, sd365 = changes(hist, "select")
+spn, spd1, spd30, _  = changes(hist, "spread")
+
+vol_rows = hist[hist["total_loads"].notna()]
+loads_now  = vol_rows.iloc[-1]["total_loads"]  if not vol_rows.empty else None
+loads_prev = vol_rows.iloc[-2]["total_loads"]  if len(vol_rows) > 1  else None
+loads_d1   = (loads_now - loads_prev) if (loads_now and loads_prev) else None
+
+
+# ── Metric Tiles — Choice ────────────────────────────────────────────────────
+
+st.markdown('<div class="sec-header">Choice Cutout — Composite 600–900 lbs</div>',
+            unsafe_allow_html=True)
+cols = st.columns(4)
+with cols[0]:
+    st.markdown(tile("Current", fmt(cn), cls="tile-choice"), unsafe_allow_html=True)
+with cols[1]:
+    st.markdown(tile("Day Change", fmt(cd1), delta_html(cd1), "tile-choice"), unsafe_allow_html=True)
+with cols[2]:
+    st.markdown(tile("Month Change", fmt(cd30), delta_html(cd30), "tile-choice"), unsafe_allow_html=True)
+with cols[3]:
+    st.markdown(tile("Year Change", fmt(cd365), delta_html(cd365), "tile-choice"), unsafe_allow_html=True)
+
+st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+# ── Metric Tiles — Select ────────────────────────────────────────────────────
+
+st.markdown('<div class="sec-header">Select Cutout — Composite 600–900 lbs</div>',
+            unsafe_allow_html=True)
+cols = st.columns(4)
+with cols[0]:
+    st.markdown(tile("Current", fmt(sn), cls="tile-select"), unsafe_allow_html=True)
+with cols[1]:
+    st.markdown(tile("Day Change", fmt(sd1), delta_html(sd1), "tile-select"), unsafe_allow_html=True)
+with cols[2]:
+    st.markdown(tile("Month Change", fmt(sd30), delta_html(sd30), "tile-select"), unsafe_allow_html=True)
+with cols[3]:
+    st.markdown(tile("Year Change", fmt(sd365), delta_html(sd365), "tile-select"), unsafe_allow_html=True)
+
+st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+# ── Metric Tiles — Spread & Volume ──────────────────────────────────────────
+
+st.markdown('<div class="sec-header">Choice–Select Spread &amp; Total Volume</div>',
+            unsafe_allow_html=True)
+cols = st.columns(4)
+with cols[0]:
+    st.markdown(tile("Choice–Select Spread", fmt(spn), delta_html(spd1), "tile-spread"),
+                unsafe_allow_html=True)
+with cols[1]:
+    st.markdown(tile("Spread Month Change", fmt(spd30), delta_html(spd30), "tile-spread"),
+                unsafe_allow_html=True)
+with cols[2]:
+    st.markdown(tile("Total Loads Today", fmt_loads(loads_now), cls="tile-vol"),
+                unsafe_allow_html=True)
+with cols[3]:
+    st.markdown(tile("Loads Day Change", fmt_loads(loads_d1), delta_html(loads_d1, " lds"), "tile-vol"),
+                unsafe_allow_html=True)
+
+
+# ── Cutout Trend Chart ───────────────────────────────────────────────────────
+
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+st.markdown('<div class="sec-header">Cutout Trend</div>', unsafe_allow_html=True)
+
+AXIS = dict(
+    gridcolor=DM_BORDER, linecolor=DM_BORDER, showgrid=True,
+    tickfont=dict(color=DM_MUTED, size=11),
+    title_font=dict(color=DM_MUTED, size=11),
+    zeroline=False,
+)
+
+fig = go.Figure()
+
+# Spread fill (rendered first so it's behind the lines)
+fig.add_trace(go.Scatter(
+    x=pd.concat([hist["report_date"], hist["report_date"].iloc[::-1]]),
+    y=pd.concat([hist["choice"], hist["select"].iloc[::-1]]),
+    fill="toself",
+    fillcolor="rgba(196,180,86,0.08)",
+    line=dict(color="rgba(0,0,0,0)"),
+    name="Spread",
+    hoverinfo="skip",
+))
+
+fig.add_trace(go.Scatter(
+    x=hist["report_date"], y=hist["choice"],
+    name="Choice",
+    mode="lines",
+    line=dict(color=CHOICE_COLOR, width=2),
+    hovertemplate="<b>Choice</b>: $%{y:.2f}<extra></extra>",
+))
+
+fig.add_trace(go.Scatter(
+    x=hist["report_date"], y=hist["select"],
+    name="Select",
+    mode="lines",
+    line=dict(color=SELECT_COLOR, width=2),
+    hovertemplate="<b>Select</b>: $%{y:.2f}<extra></extra>",
+))
+
+fig.update_layout(
+    paper_bgcolor=DM_SURFACE2, plot_bgcolor=DM_SURFACE2,
+    font=dict(color=DM_TEXT, size=11),
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                font=dict(color=DM_TEXT, size=11), bgcolor="rgba(0,0,0,0)"),
+    margin=dict(l=55, r=20, t=15, b=40),
+    xaxis=dict(
+        **AXIS, title="",
+        rangeselector=dict(
+            buttons=[
+                dict(count=1,  label="1M",  step="month", stepmode="backward"),
+                dict(count=3,  label="3M",  step="month", stepmode="backward"),
+                dict(count=6,  label="6M",  step="month", stepmode="backward"),
+                dict(count=1,  label="YTD", step="year",  stepmode="todate"),
+                dict(count=1,  label="1Y",  step="year",  stepmode="backward"),
+                dict(step="all", label="All"),
+            ],
+            bgcolor=DM_SURFACE, activecolor=JSA_GREEN,
+            font=dict(color=DM_TEXT, size=10), bordercolor=DM_BORDER,
+        ),
+        rangeslider=dict(visible=False),
+        type="date",
+    ),
+    yaxis=dict(**AXIS, title="$/cwt", tickprefix="$"),
+    height=380,
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+
+# ── Volume Chart ─────────────────────────────────────────────────────────────
+
+if hist["total_loads"].notna().any():
+    st.markdown('<div class="sec-header">Total Daily Loads</div>', unsafe_allow_html=True)
+
+    vd = hist[hist["total_loads"].notna()].copy()
+    ma = vd["total_loads"].rolling(10, min_periods=1).mean()
+
+    fig_v = go.Figure()
+    fig_v.add_trace(go.Bar(
+        x=vd["report_date"], y=vd["total_loads"],
+        name="Total Loads", marker_color=VOL_COLOR, marker_line_width=0,
+        hovertemplate="<b>Total Loads</b>: %{y:.1f}<extra></extra>",
+    ))
+    fig_v.add_trace(go.Scatter(
+        x=vd["report_date"], y=ma,
+        name="10-Day Avg", mode="lines",
+        line=dict(color=JSA_GREEN_LT, width=2, dash="dot"),
+        hovertemplate="<b>10-Day Avg</b>: %{y:.1f}<extra></extra>",
+    ))
+    fig_v.update_layout(
+        paper_bgcolor=DM_SURFACE2, plot_bgcolor=DM_SURFACE2,
+        font=dict(color=DM_TEXT, size=11), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                    font=dict(color=DM_TEXT, size=11), bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=55, r=20, t=15, b=40),
+        xaxis=dict(**AXIS, title=""),
+        yaxis=dict(**AXIS, title="Loads"),
+        height=250, bargap=0.15,
+    )
+    st.plotly_chart(fig_v, use_container_width=True)
+
+
+# ── Data Table ───────────────────────────────────────────────────────────────
+
+with st.expander("📋  Data Table"):
+    display = hist.copy()
+    display["report_date"] = display["report_date"].dt.strftime("%Y-%m-%d")
+    display = display.rename(columns={
+        "report_date":   "Date",
+        "choice":        "Choice ($/cwt)",
+        "select":        "Select ($/cwt)",
+        "spread":        "Spread ($/cwt)",
+        "total_loads":   "Total Loads",
+        "choice_loads":  "Choice Loads",
+        "select_loads":  "Select Loads",
+    }).sort_values("Date", ascending=False).reset_index(drop=True)
+
+    num_cols = {c: "${:.2f}" for c in ["Choice ($/cwt)", "Select ($/cwt)", "Spread ($/cwt)"]}
+    num_cols.update({c: "{:.1f}" for c in ["Total Loads", "Choice Loads", "Select Loads"]
+                     if c in display.columns})
+    st.dataframe(display.style.format(num_cols, na_rep="—"),
+                 use_container_width=True, height=320)
+
+
+# ── Debug Expander ────────────────────────────────────────────────────────────
+
+with st.expander("🔧  Raw API Debug"):
+    st.write("**API endpoint:**", f"{LMR_BASE}/{REPORT_ID}/?lastReports={history_n}&allSections=true")
+    st.write("**Sections returned:**", list(sections.keys()))
+    st.write("**History rows:**", len(hist))
+    for sec_name, sec_df in sections.items():
+        if not sec_df.empty:
+            st.write(f"**{sec_name}** — {len(sec_df)} rows, columns: {list(sec_df.columns)}")
+    if not hist.empty:
+        st.dataframe(hist.tail(10))
+
+
+# ── Auto-refresh ─────────────────────────────────────────────────────────────
+
+if auto_refresh:
+    time.sleep(1800)
+    st.cache_data.clear()
+    st.rerun()
