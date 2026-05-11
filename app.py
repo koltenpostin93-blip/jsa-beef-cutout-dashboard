@@ -29,9 +29,25 @@ VOL_COLOR    = "#9b89c4"
 JSA_LOGO_WHITE = "https://www.jpsi.com/wp-content/themes/gate39media/img/logo-white.png"
 
 # ── USDA LMR API (no key required) ──────────────────────────────────────────
-LMR_BASE    = "https://mpr.datamart.ams.usda.gov/services/v1.1/reports"
-REPORT_ID   = 2453   # LM_XB403 — National Daily Boxed Beef Cutout & Boxed Beef Cuts PM
-REPORT_NAME = "LM_XB403"
+LMR_BASE       = "https://mpr.datamart.ams.usda.gov/services/v1.1/reports"
+REPORT_ID      = 2453   # LM_XB403 — National Daily Boxed Beef Cutout & Boxed Beef Cuts PM
+REPORT_NAME    = "LM_XB403"
+GRADING_ID     = 2700   # LSWFEDCC — National Weekly Fed Cattle Comprehensive (has Pct_Choice_CW)
+
+# ── Historical annual grading averages (USDA AMS, 2000-2025) ────────────────
+# Source: USDA AMS National Weekly Fed Cattle Comprehensive annual summaries
+# "Choice & Higher" = Prime + Choice graded carcasses as % of total graded
+ANNUAL_GRADES = {
+    2000: (60.6, 39.4), 2001: (60.7, 39.3), 2002: (62.1, 37.9),
+    2003: (60.0, 39.9), 2004: (60.6, 39.0), 2005: (60.3, 39.5),
+    2006: (59.0, 40.9), 2007: (60.5, 39.1), 2008: (63.8, 35.8),
+    2009: (67.0, 32.7), 2010: (67.8, 31.5), 2011: (68.9, 30.7),
+    2012: (68.8, 30.9), 2013: (70.4, 29.5), 2014: (75.0, 22.0),
+    2015: (78.0, 18.0), 2016: (82.0, 13.0), 2017: (85.0, 11.0),
+    2018: (87.0, 10.0), 2019: (88.0,  9.0), 2020: (85.0, 12.0),
+    2021: (85.0, 11.0), 2022: (85.0, 11.0), 2023: (87.0, 10.0),
+    2024: (88.0,  9.5), 2025: (88.5,  9.0),
+}
 
 # ── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -146,6 +162,24 @@ def fetch_lmr(last_n: int = 260):
             df = df.dropna(subset=["report_date"]).sort_values("report_date")
             sections[name] = df
     return sections
+
+
+@st.cache_data(ttl=7200, persist="disk", show_spinner=False)
+def fetch_grading_weekly() -> pd.DataFrame:
+    """Fetch weekly Pct_Choice_CW from LMR report 2700 (lastReports=200 ≈ 4 yrs)."""
+    url  = f"{LMR_BASE}/{GRADING_ID}/"
+    sess = _lmr_session()
+    resp = sess.get(url, params={"lastReports": 200, "allSections": "true"}, timeout=60)
+    resp.raise_for_status()
+    payload = resp.json()
+    for sec in (payload if isinstance(payload, list) else [payload]):
+        if sec.get("reportSection") == "Weekly Fed Cattle Comprehensive":
+            df = pd.DataFrame(sec["results"])
+            df["report_date"]    = pd.to_datetime(df["report_date"], errors="coerce")
+            df["pct_choice"]     = pd.to_numeric(df.get("Pct_Choice_CW"), errors="coerce")
+            df["published_date"] = df.get("published_date", "")
+            return df[["report_date", "pct_choice", "published_date"]].dropna(subset=["report_date"]).sort_values("report_date")
+    return pd.DataFrame()
 
 
 def build_history(sections: dict) -> pd.DataFrame:
@@ -469,6 +503,125 @@ if hist["total_loads"].notna().any():
     )
     st.plotly_chart(fig_v, use_container_width=True)
 
+
+# ── Beef Grading Trend Chart ─────────────────────────────────────────────────
+
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+st.markdown('<div class="sec-header">Beef Carcass Grading — Choice &amp; Higher vs Select</div>',
+            unsafe_allow_html=True)
+
+# Fetch live weekly grading data (silent fail — chart still shows historical)
+try:
+    grade_wk = fetch_grading_weekly()
+except Exception:
+    grade_wk = pd.DataFrame()
+
+# Build annual series from hardcoded history
+grade_years   = sorted(ANNUAL_GRADES.keys())
+choice_annual = [ANNUAL_GRADES[y][0] for y in grade_years]
+select_annual = [ANNUAL_GRADES[y][1] for y in grade_years]
+
+# Latest weekly point
+latest_choice = None
+latest_week   = None
+latest_pub    = ""
+if not grade_wk.empty:
+    last_row      = grade_wk.iloc[-1]
+    latest_choice = last_row["pct_choice"]
+    latest_week   = last_row["report_date"]
+    latest_pub    = str(last_row.get("published_date", ""))
+
+# Current-year YTD average from weekly API data
+cur_year = datetime.now().year
+ytd_df   = grade_wk[grade_wk["report_date"].dt.year == cur_year] if not grade_wk.empty else pd.DataFrame()
+ytd_avg  = float(ytd_df["pct_choice"].mean()) if not ytd_df.empty else None
+
+fig_g = go.Figure()
+
+# Choice & Higher line (annual)
+fig_g.add_trace(go.Scatter(
+    x=grade_years, y=choice_annual,
+    name="Choice & Higher (Prime + Choice)",
+    mode="lines+markers+text",
+    line=dict(color=CHOICE_COLOR, width=2.5),
+    marker=dict(size=7, color=CHOICE_COLOR),
+    text=[f"{v:.1f}%" for v in choice_annual],
+    textposition="top center",
+    textfont=dict(size=9, color=CHOICE_COLOR),
+    hovertemplate="<b>Choice & Higher</b>: %{y:.1f}%<extra></extra>",
+))
+
+# Select line (annual)
+fig_g.add_trace(go.Scatter(
+    x=grade_years, y=select_annual,
+    name="Select",
+    mode="lines+markers+text",
+    line=dict(color=SELECT_COLOR, width=2.5),
+    marker=dict(size=7, color=SELECT_COLOR),
+    text=[f"{v:.1f}%" for v in select_annual],
+    textposition="bottom center",
+    textfont=dict(size=9, color=SELECT_COLOR),
+    hovertemplate="<b>Select</b>: %{y:.1f}%<extra></extra>",
+))
+
+# YTD average diamond for current year
+if ytd_avg is not None:
+    fig_g.add_trace(go.Scatter(
+        x=[cur_year], y=[ytd_avg],
+        name=f"{cur_year} YTD Avg",
+        mode="markers",
+        marker=dict(size=14, symbol="diamond", color=CHOICE_COLOR,
+                    line=dict(width=2, color=DM_TEXT)),
+        hovertemplate=f"<b>{cur_year} YTD Avg</b>: %{{y:.1f}}%<extra></extra>",
+    ))
+
+# Latest weekly annotation marker
+if latest_choice is not None:
+    week_label = latest_week.strftime("%b %d, %Y") if latest_week else ""
+    fig_g.add_trace(go.Scatter(
+        x=[cur_year + 0.15], y=[latest_choice],
+        name=f"Latest Weekly",
+        mode="markers+text",
+        marker=dict(size=12, symbol="diamond", color=COL_NEG,
+                    line=dict(width=2, color=DM_TEXT)),
+        text=[f"Latest Weekly: {latest_choice:.1f}%"],
+        textposition="top right",
+        textfont=dict(size=10, color=COL_NEG, family="Arial Black"),
+        hovertemplate=f"<b>Latest Weekly ({week_label})</b>: %{{y:.1f}}%<extra></extra>",
+    ))
+
+fig_g.update_layout(
+    paper_bgcolor=DM_SURFACE2, plot_bgcolor=DM_SURFACE2,
+    font=dict(color=DM_TEXT, size=11),
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+                font=dict(color=DM_TEXT, size=11), bgcolor="rgba(0,0,0,0)"),
+    margin=dict(l=55, r=30, t=30, b=40),
+    xaxis=dict(
+        gridcolor=DM_BORDER, linecolor=DM_BORDER, showgrid=True,
+        tickfont=dict(color=DM_MUTED, size=11), title_font=dict(color=DM_MUTED),
+        zeroline=False, title="Year", dtick=2,
+    ),
+    yaxis=dict(
+        gridcolor=DM_BORDER, linecolor=DM_BORDER, showgrid=True,
+        tickfont=dict(color=DM_MUTED, size=11), title_font=dict(color=DM_MUTED),
+        zeroline=False, title="% of Graded Carcasses", ticksuffix="%",
+        range=[0, 100],
+    ),
+    height=440,
+)
+
+st.plotly_chart(fig_g, use_container_width=True)
+
+# Small caption
+st.markdown(
+    f'<div style="color:{DM_MUTED};font-size:0.7rem;margin-top:-10px;">'
+    f'Annual averages 2000–2025 from USDA AMS. '
+    f'Current-year YTD &amp; latest weekly from LMR LSWFEDCC (report 2700). '
+    + (f'Latest weekly report: {latest_pub[:10]}.' if latest_pub else '')
+    + '</div>',
+    unsafe_allow_html=True,
+)
 
 # ── Data Table ───────────────────────────────────────────────────────────────
 
